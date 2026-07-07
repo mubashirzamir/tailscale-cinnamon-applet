@@ -3,6 +3,7 @@
  * TODO(3): extend exit-node picker to dynamic list via `tailscale exit-node list`.
  * TODO(4): remove legacy .env support; move exit-node config to cinnamon settings schema.
  * TODO(5): add cinnamon settings schema.json for official Spices submission.
+ * TODO(6): validate node selector on load and if empty treat like no-exit-node mode.
  */
 const Applet = imports.ui.applet;
 const PopupMenu = imports.ui.popupMenu;
@@ -51,6 +52,27 @@ function _getTailscaleState() {
     return "down";
 }
 
+function _getExitNodes() {
+    // Returns array of strings: hostnames of available exit nodes.
+    let [success, out, err, status] = GLib.spawn_command_line_sync(
+        "tailscale exit-node list --json 2>/dev/null"
+    );
+    if (!success || out.length === 0) {
+        return [];
+    }
+
+    let text = GLib.convert(out, -1, "UTF-8", null)[1];
+    try {
+        let data = JSON.parse(text);
+        if (Array.isArray(data)) {
+            return data.map(function(n) { return n.Hostname; });
+        }
+    } catch (e) {
+        // fall through
+    }
+    return [];
+}
+
 function _iconPath(appletDir, state) {
     let names = {
         "down": "tailscale-off-symbolic.svg",
@@ -74,6 +96,8 @@ TailscaleApplet.prototype = {
         this.state = "down";
         this.pollId = null;
         this._settleTimeout = null;
+        this.exitNodes = [];
+        this.exitNodeMenuItems = {};
 
         this._loadSettings();
         this._buildMenu();
@@ -91,8 +115,6 @@ TailscaleApplet.prototype = {
     // ------- Settings -------------------------------------------------
 
     _loadSettings: function() {
-        // TODO(5): schema file exists; for now also provide a fallback if
-        // Cinnamon doesn't read settings-schema.json.
         this.settings = new Settings.AppletSettings(this, UUID, this._instanceId || "0");
         this.settings.bindProperty(Settings.BindingDirection.IN, "poll_interval", "poll_interval", null, null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "preferred_exit_node", "preferred_exit_node", null, null);
@@ -119,11 +141,12 @@ TailscaleApplet.prototype = {
         }));
         this.menu.addMenuItem(this.noExitItem);
 
-        this.exitItem = new PopupMenu.PopupMenuItem(_("Connect via preferred exit node"));
-        this.exitItem.connect('activate', Lang.bind(this, function() {
-            this._connectPreferred();
-        }));
-        this.menu.addMenuItem(this.exitItem);
+        // exit-node parent item: toggles a dynamic submenu
+        this.exitNodeParent = new PopupMenu.PopupSubMenuMenuItem(_("Connect via exit node"));
+        this.exitNodeMenu = new PopupMenu.PopupSubMenu(this, this.exitNodeParent);
+        this.menu.addMenuItem(this.exitNodeParent);
+
+        this._refreshExitNodes();
 
         this.disconnectItem = new PopupMenu.PopupMenuItem(_("Disconnect"));
         this.disconnectItem.connect('activate', Lang.bind(this, function() {
@@ -131,6 +154,43 @@ TailscaleApplet.prototype = {
             this._scheduleUIUpdate(2);
         }));
         this.menu.addMenuItem(this.disconnectItem);
+    },
+
+    _refreshExitNodes: function() {
+        // rebuild exit-node submenu items from live tailnet state
+        let nodes = _getExitNodes();
+        this.exitNodes = nodes;
+
+        // clear existing dynamic items
+        let toRemove = [];
+        for (let key in this.exitNodeMenuItems) {
+            toRemove.push(this.exitNodeMenuItems[key]);
+        }
+        for (let i = 0; i < toRemove.length; i++) {
+            this.exitNodeMenu.removeMenuItem(toRemove[i]);
+        }
+        this.exitNodeMenuItems = {};
+
+        // repopulate
+        for (let i = 0; i < nodes.length; i++) {
+            let hostname = nodes[i];
+            let item = new PopupMenu.PopupMenuItem(hostname);
+            item.connect('activate', Lang.bind(this, function() {
+                let node = hostname;
+                _runTailscale("up --exit-node=" + node + " --exit-node-allow-lan-access=true --accept-routes");
+                this._scheduleUIUpdate(2);
+            }));
+            this.exitNodeMenu.addMenuItem(item);
+            this.exitNodeMenuItems[hostname] = item;
+        }
+
+        // ensure there is at least one hint if list is empty
+        if (nodes.length === 0) {
+            let hint = new PopupMenu.PopupMenuItem(_("No exit nodes available"));
+            hint.setSensitive(false);
+            this.exitNodeMenu.addMenuItem(hint);
+            this.exitNodeMenuItems["__hint"] = hint;
+        }
     },
 
     _connectPreferred: function() {
@@ -154,6 +214,7 @@ TailscaleApplet.prototype = {
     on_applet_clicked: function(event) {
         let state = _getTailscaleState();
         this.switchItem.setToggleState(state !== "down");
+        this._refreshExitNodes();
         this.menu.toggle();
     },
 
