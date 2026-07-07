@@ -1,9 +1,5 @@
-/* TODO(1): add gettext translation wrapper once we finalize strings.
- * TODO(2): confirm polkit behavior; keep direct tailscale or wrap with root helper.
- * TODO(3): extend exit-node picker to dynamic list via `tailscale exit-node list`.
- * TODO(4): remove legacy .env support; move exit-node config to cinnamon settings schema.
- * TODO(5): add cinnamon settings schema.json for official Spices submission.
- * TODO(6): validate node selector on load and if empty treat like no-exit-node mode.
+/* TODO(2): confirm polkit behavior; keep direct tailscale or wrap with root helper.
+ * TODO(4): update .po catalogs; compile .mo into locale directories at install time.
  */
 const Applet = imports.ui.applet;
 const PopupMenu = imports.ui.popupMenu;
@@ -15,9 +11,12 @@ const Settings = imports.ui.settings;
 const UUID = "tailscale@mubashirzamir";
 const HOME_DIR = GLib.get_home_dir();
 
-// TODO(1): Replace with proper gettext setup + .pot/.po once translations are added.
+// gettext / l10n setup
+const Gettext = imports.gettext;
+const LOCALE_DIR = UUID; // Gettext.bindtextdomain resolves relative to ~/.local/share/locale when NULL is passed
+Gettext.bindtextdomain(UUID, null, null);
 function _(text) {
-    return text;
+    return Gettext.dgettext(UUID, text);
 }
 
 // TODO(2): Once we confirm Mint/Tailscale polkit behavior, either remove
@@ -226,10 +225,9 @@ TailscaleApplet.prototype = {
         this.state = _getTailscaleState();
         this.set_applet_icon_symbolic_path(_iconPath(this.appletDir, this.state));
 
-        // TODO(1): replace hardcoded tooltips with _() translations once we add gettext.
         let tooltip = this.state === "up"
-            ? "Tailscale: On"
-            : (this.state === "up-exit" ? "Tailscale: On (exit node)" : "Tailscale: Off");
+            ? _("Tailscale: On")
+            : (this.state === "up-exit" ? _("Tailscale: On (exit node)") : _("Tailscale: Off"));
         this.set_applet_tooltip(tooltip);
 
         if (this.switchItem) {
