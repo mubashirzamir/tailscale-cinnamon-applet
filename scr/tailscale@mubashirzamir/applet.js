@@ -195,7 +195,7 @@ TailscaleApplet.prototype = {
 
     _connectPreferred: function() {
         let node = (this.preferred_exit_node || "").trim();
-        if (!node) {
+        if (!node || this.exitNodes.indexOf(node) === -1) {
             _runTailscale("up --reset --accept-routes");
         } else {
             _runTailscale("up --exit-node=" + node + " --exit-node-allow-lan-access=true --accept-routes");
