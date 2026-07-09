@@ -6,23 +6,23 @@ States are: down, up, up with exit node.
 
 The user can change state from the applet.
 
-The exit not is to be declared in the .env file.
-
 ## Installation in Linux Mint Cinnamon
 
-1. Install the depedencies
-sudo apt install yad jq
+1. Copy the applet files in:
+```/usr/share/cinnamon/applets/tailscale@mubashirzamir```
+Or, if you want an installation for the current user only, in:
+```$HOME/.local/share/cinnamon/applets/tailscale@mubashirzamir```
 
-2. Copy the applet files in:  
-```/usr/share/cinnamon/applets/tailscale@$USER```  
-Or, if you want an installation for the current user only, in:  
-```$HOME/.local/share/cinnamon/applets/tailscale@$USER```
-
-3. Edit the .env file:  
-```EXITNODE=name-of-your-tailscale-exit-node-machine```
-
-4. Restart Cinnamon:  
+2. Restart Cinnamon:
 Alt+F2 -> enter the command: r
 
-5. Add the applet in the taskbar:  
+3. Add the applet in the taskbar:
 Right click on the taskbar -> Applets
+
+## Configuration
+
+Right-click the applet -> Configure to set:
+
+- **Poll interval**: seconds between Tailscale state refreshes (10-120, default 60)
+- **Preferred exit node**: hostname of your default exit node (leave empty for none)
+- **Auto-connect on load**: run `tailscale up` when the applet starts

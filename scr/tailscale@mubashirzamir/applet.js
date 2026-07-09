@@ -1,284 +1,400 @@
-/* TODO(2): confirm polkit behavior; keep direct tailscale or wrap with root helper.
- * TODO(4): update .po catalogs; compile .mo into locale directories at install time.
- */
 const Applet = imports.ui.applet;
 const PopupMenu = imports.ui.popupMenu;
-const Util = imports.misc.util;
+const Main = imports.ui.main;
+const ByteArray = imports.byteArray;
 const GLib = imports.gi.GLib;
+const Lang = imports.lang;
 const Mainloop = imports.mainloop;
 const Settings = imports.ui.settings;
+const Gettext = imports.gettext;
 
 const UUID = "tailscale@mubashirzamir";
-const HOME_DIR = GLib.get_home_dir();
 
-// gettext / l10n setup
-const Gettext = imports.gettext;
-const LOCALE_DIR = UUID; // Gettext.bindtextdomain resolves relative to ~/.local/share/locale when NULL is passed
-Gettext.bindtextdomain(UUID, null, null);
 function _(text) {
     return Gettext.dgettext(UUID, text);
 }
 
-// TODO(2): Once we confirm Mint/Tailscale polkit behavior, either remove
-// this entirely or turn it into a small wrapper.
-function _runTailscale(args) {
-    let [ok, out, err, status] = GLib.spawn_command_line_sync(
-        "tailscale " + args + " 2>&1"
-    );
-    return ok;
+function _runTailscale(args, callback) {
+    try {
+        let [ok, argv] = GLib.shell_parse_argv("pkexec tailscale " + args);
+        if (!ok) {
+            if (callback) callback(false, _("Failed to parse command: ") + args);
+            return;
+        }
+        let flags = GLib.SpawnFlags.SEARCH_PATH | GLib.SpawnFlags.DO_NOT_REAP_CHILD;
+        let [success, pid] = GLib.spawn_async(null, argv, null, flags, null);
+        if (!success) {
+            if (callback) callback(false, _("Failed to spawn tailscale"));
+            return;
+        }
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, pid, function(pid, status) {
+            let ok = GLib.spawn_check_wait_status(status);
+            if (callback) callback(ok, ok ? null : _("tailscale exited with status ") + status);
+        });
+    } catch (e) {
+        if (callback) callback(false, String(e));
+    }
 }
 
-function _getTailscaleState() {
-    let [success, out, err, status] = GLib.spawn_command_line_sync(
-        "tailscale status --peers=false --json 2>/dev/null"
-    );
-    if (!success || out.length === 0) {
-        return "down";
-    }
-
-    let text = GLib.convert(out, -1, "UTF-8", null)[1];
+function _getTailscaleStatus() {
     try {
+        let [success, out] = GLib.spawn_command_line_sync("tailscale status --peers=false --json");
+        if (!success || out.length === 0) return { state: "down", exitNode: null };
+        let text = ByteArray.toString(out);
         let data = JSON.parse(text);
         if (data.Self && data.Self.Online === true) {
-            if (data.ExitNodeStatus) {
-                return "up-exit";
+            if (data.ExitNodeStatus && data.ExitNodeStatus.HostName) {
+                return { state: "up-exit", exitNode: data.ExitNodeStatus.HostName };
             }
-            return "up";
+            return { state: "up", exitNode: null };
         }
     } catch (e) {
-        // fall through
+        global.logError("tailscale@mubashirzamir: Failed to read status: " + e);
     }
-    return "down";
+    return { state: "down", exitNode: null };
 }
 
 function _getExitNodes() {
-    // Returns array of strings: hostnames of available exit nodes.
-    let [success, out, err, status] = GLib.spawn_command_line_sync(
-        "tailscale exit-node list --json 2>/dev/null"
-    );
-    if (!success || out.length === 0) {
-        return [];
-    }
-
-    let text = GLib.convert(out, -1, "UTF-8", null)[1];
     try {
-        let data = JSON.parse(text);
-        if (Array.isArray(data)) {
-            return data.map(function(n) { return n.Hostname; });
+        let [success, out] = GLib.spawn_command_line_sync("tailscale exit-node list");
+        if (!success || out.length === 0) return [];
+        let text = ByteArray.toString(out);
+        let lines = text.split("\n");
+        let nodes = [];
+        for (let i = 1; i < lines.length; i++) {
+            let hostname = lines[i].split(/\s+/)[0];
+            if (hostname && hostname.length > 0) {
+                nodes.push(hostname);
+            }
         }
-    } catch (e) {
-        // fall through
-    }
+        return nodes;
+    } catch (e) {}
     return [];
 }
 
-function _iconPath(appletDir, state) {
-    let names = {
-        "down": "tailscale-off-symbolic.svg",
-        "up": "tailscale-on-symbolic.svg",
-        "up-exit": "tailscale-exit-symbolic.svg"
-    };
-    return appletDir + "/icons/" + (names[state] || names["down"]);
-}
+class TailscaleApplet extends Applet.IconApplet {
+    constructor(metadata, orientation, panelHeight, instanceId) {
+        super(orientation, panelHeight, instanceId);
+        this.orientation = orientation;
 
-function TailscaleApplet(orientation, panelHeight, instanceId) {
-    this._init(orientation, panelHeight, instanceId);
-}
+        this.metadata = metadata;
+        this.instanceId = instanceId;
 
-TailscaleApplet.prototype = {
-    __proto__: Applet.IconApplet.prototype,
-
-    _init: function(orientation, panelHeight, instanceId) {
-        Applet.IconApplet.prototype._init.call(this, orientation, panelHeight, instanceId);
-
-        this.appletDir = null; // set by main()
-        this.state = "down";
+        this.activeExitNode = null;
         this.pollId = null;
         this._settleTimeout = null;
-        this.exitNodes = [];
-        this.exitNodeMenuItems = {};
+        this._commandPending = false;
+        this._pendingTimeout = null;
+        this._logBuffer = [];
 
-        this._loadSettings();
+        this._initSettings(metadata, instanceId);
         this._buildMenu();
         this._updateUI();
 
-        if (this.settings.getValue("auto_connect_on_load")) {
+        if (this.auto_connect_on_load) {
             this._connectPreferred();
         }
-    },
 
-    on_applet_removed_from_panel: function() {
-        this._stopPolling();
-    },
+        this._log("Applet initialized");
 
-    // ------- Settings -------------------------------------------------
+        Mainloop.idle_add(Lang.bind(this, function() {
+            this._startPolling();
+            return false;
+        }));
+    }
 
-    _loadSettings: function() {
-        this.settings = new Settings.AppletSettings(this, UUID, this._instanceId || "0");
-        this.settings.bindProperty(Settings.BindingDirection.IN, "poll_interval", "poll_interval", null, null);
+    _log(message) {
+        global.log("tailscale@mubashirzamir: " + message);
+        this._logBuffer.push({ text: message, isError: false });
+        if (this._logBuffer.length > 20) this._logBuffer.shift();
+    }
+
+    _logError(message) {
+        global.logError("tailscale@mubashirzamir: " + message);
+        this._logBuffer.push({ text: message, isError: true });
+        if (this._logBuffer.length > 20) this._logBuffer.shift();
+    }
+
+    _initSettings(metadata, instanceId) {
+        this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
+        this.settings.bindProperty(Settings.BindingDirection.IN, "poll_interval", "poll_interval", this._onPollIntervalChanged.bind(this), null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "preferred_exit_node", "preferred_exit_node", null, null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "auto_connect_on_load", "auto_connect_on_load", null, null);
-    },
+        this.settings.bindProperty(Settings.BindingDirection.IN, "show_debug", "show_debug", null, null);
+    }
 
-    // ------- Menu ----------------------------------------------------
+    _onPollIntervalChanged() {
+        if (this.pollId) {
+            this._log("Poll interval changed to " + this.poll_interval + "s");
+            this._startPolling();
+        }
+    }
 
-    _buildMenu: function() {
+    _buildMenu() {
         this.menuManager = new PopupMenu.PopupMenuManager(this);
-        this.menu = new Applet.AppletPopupMenu(this, this.meta.orientation);
+        this.menu = new Applet.AppletPopupMenu(this, this.orientation);
         this.menuManager.addMenu(this.menu);
 
+        this.menu.actor.style = "min-width: 220px";
+
         this.switchItem = new PopupMenu.PopupSwitchMenuItem(_("Tailscale"), false);
-        this.switchItem.connect('toggled', Lang.bind(this, this._onToggle));
+        this.switchItem.connect("toggled", Lang.bind(this, this._onToggle));
         this.menu.addMenuItem(this.switchItem);
+
+        this.statusItem = new PopupMenu.PopupMenuItem("");
+        this.statusItem.setSensitive(false);
+        this.statusItem.actor.hide();
+        this.menu.addMenuItem(this.statusItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this.noExitItem = new PopupMenu.PopupMenuItem(_("Connect without exit node"));
-        this.noExitItem.connect('activate', Lang.bind(this, function() {
-            _runTailscale("up --reset --accept-routes");
-            this._scheduleUIUpdate(2);
-        }));
-        this.menu.addMenuItem(this.noExitItem);
-
-        // exit-node parent item: toggles a dynamic submenu
-        this.exitNodeParent = new PopupMenu.PopupSubMenuMenuItem(_("Connect via exit node"));
-        this.exitNodeMenu = new PopupMenu.PopupSubMenu(this, this.exitNodeParent);
+        this.exitNodeParent = new PopupMenu.PopupSubMenuMenuItem(_("Select exit node"));
         this.menu.addMenuItem(this.exitNodeParent);
 
+        this.debugParent = new PopupMenu.PopupSubMenuMenuItem(_("Debug"));
+        this.debugParent.actor.hide();
+        this.menu.addMenuItem(this.debugParent);
+
         this._refreshExitNodes();
+    }
 
-        this.disconnectItem = new PopupMenu.PopupMenuItem(_("Disconnect"));
-        this.disconnectItem.connect('activate', Lang.bind(this, function() {
-            _runTailscale("down");
-            this._scheduleUIUpdate(2);
+    _onToggle(item) {
+        this._commandPending = true;
+        this.set_applet_tooltip(item.state ? _("Connecting...") : _("Disconnecting..."));
+        this.statusItem.label.set_text(item.state ? _("Connecting...") : _("Disconnecting..."));
+        this.statusItem.actor.show();
+
+        if (this._pendingTimeout) {
+            Mainloop.source_remove(this._pendingTimeout);
+        }
+        this._pendingTimeout = Mainloop.timeout_add_seconds(30, Lang.bind(this, function() {
+            this._pendingTimeout = null;
+            this._commandPending = false;
+            this.statusItem.actor.hide();
+            this._log("Cleared pending state after timeout");
+            return false;
         }));
-        this.menu.addMenuItem(this.disconnectItem);
-    },
 
-    _refreshExitNodes: function() {
-        // rebuild exit-node submenu items from live tailnet state
+        let pendingDone = Lang.bind(this, function() {
+            if (this._pendingTimeout) {
+                Mainloop.source_remove(this._pendingTimeout);
+                this._pendingTimeout = null;
+            }
+            this.statusItem.actor.hide();
+            this._commandPending = false;
+        });
+
+        if (item.state) {
+            if (this.activeExitNode) {
+                _runTailscale("up --exit-node=" + this.activeExitNode + " --exit-node-allow-lan-access=true --accept-routes", Lang.bind(this, function(ok, msg) {
+                    pendingDone();
+                    if (!ok) {
+                        this._showError(msg);
+                    } else {
+                        this._log("Connected via exit node: " + this.activeExitNode);
+                    }
+                    this._scheduleUIUpdate(2);
+                }));
+            } else {
+                _runTailscale("up --reset --accept-routes", Lang.bind(this, function(ok, msg) {
+                    pendingDone();
+                    if (!ok) {
+                        this._showError(msg);
+                    } else {
+                        this._log("Connected");
+                    }
+                    this._scheduleUIUpdate(2);
+                }));
+            }
+        } else {
+            _runTailscale("down", Lang.bind(this, function(ok, msg) {
+                pendingDone();
+                if (!ok) {
+                    this._showError(msg);
+                } else {
+                    this._log("Disconnected");
+                }
+                this._scheduleUIUpdate(2);
+            }));
+        }
+    }
+
+    _connectPreferred() {
+        let node = (this.preferred_exit_node || "").trim();
+        if (node) {
+            _runTailscale("up --exit-node=" + node + " --exit-node-allow-lan-access=true --accept-routes", Lang.bind(this, function(ok, msg) {
+                if (!ok) {
+                    this._logError(msg || _("Failed to connect with preferred exit node"));
+                } else {
+                    this._log("Auto-connected via preferred exit node: " + node);
+                }
+                this._scheduleUIUpdate(2);
+            }));
+        } else {
+            _runTailscale("up --reset --accept-routes", Lang.bind(this, function(ok, msg) {
+                if (!ok) {
+                    this._logError(msg || _("Failed to connect"));
+                } else {
+                    this._log("Auto-connected");
+                }
+                this._scheduleUIUpdate(2);
+            }));
+        }
+    }
+
+    _refreshExitNodes() {
         let nodes = _getExitNodes();
-        this.exitNodes = nodes;
+        let submenu = this.exitNodeParent.menu;
 
-        // clear existing dynamic items
-        let toRemove = [];
-        for (let key in this.exitNodeMenuItems) {
-            toRemove.push(this.exitNodeMenuItems[key]);
-        }
-        for (let i = 0; i < toRemove.length; i++) {
-            this.exitNodeMenu.removeMenuItem(toRemove[i]);
-        }
-        this.exitNodeMenuItems = {};
+        submenu.removeAll();
 
-        // repopulate
         for (let i = 0; i < nodes.length; i++) {
             let hostname = nodes[i];
             let item = new PopupMenu.PopupMenuItem(hostname);
-            item.connect('activate', Lang.bind(this, function() {
-                let node = hostname;
-                _runTailscale("up --exit-node=" + node + " --exit-node-allow-lan-access=true --accept-routes");
-                this._scheduleUIUpdate(2);
+            if (hostname === this.activeExitNode) {
+                item.setOrnament(PopupMenu.Ornament.CHECK);
+            }
+            item.connect("activate", Lang.bind(this, function() {
+                let selected = hostname;
+                _runTailscale("up --exit-node=" + selected + " --exit-node-allow-lan-access=true --accept-routes", Lang.bind(this, function(ok, msg) {
+                    if (!ok) {
+                        this._showError(msg);
+                    } else {
+                        this._log("Connected via exit node: " + selected);
+                    }
+                    this._scheduleUIUpdate(2);
+                }));
             }));
-            this.exitNodeMenu.addMenuItem(item);
-            this.exitNodeMenuItems[hostname] = item;
+            submenu.addMenuItem(item);
         }
 
-        // ensure there is at least one hint if list is empty
         if (nodes.length === 0) {
             let hint = new PopupMenu.PopupMenuItem(_("No exit nodes available"));
             hint.setSensitive(false);
-            this.exitNodeMenu.addMenuItem(hint);
-            this.exitNodeMenuItems["__hint"] = hint;
+            submenu.addMenuItem(hint);
         }
-    },
+    }
 
-    _connectPreferred: function() {
-        let node = (this.preferred_exit_node || "").trim();
-        if (!node || this.exitNodes.indexOf(node) === -1) {
-            _runTailscale("up --reset --accept-routes");
-        } else {
-            _runTailscale("up --exit-node=" + node + " --exit-node-allow-lan-access=true --accept-routes");
+    _updateUI() {
+        let status = _getTailscaleStatus();
+        let iconName;
+
+        switch (status.state) {
+            case "up":
+                iconName = "tailscale-on-symbolic.svg";
+                this.set_applet_tooltip(_("Tailscale: On"));
+                break;
+            case "up-exit":
+                iconName = "tailscale-exit-symbolic.svg";
+                this.set_applet_tooltip(_("Tailscale: On (exit node)"));
+                break;
+            default:
+                iconName = "tailscale-off-symbolic.svg";
+                this.set_applet_tooltip(_("Tailscale: Off"));
         }
-        this._scheduleUIUpdate(2);
-    },
 
-    _onToggle: function(item) {
-        let cmd = item.state
-            ? "tailscale up --reset --accept-routes"
-            : "tailscale down";
-        _runTailscale(cmd);
-        this._scheduleUIUpdate(2);
-    },
+        if (this._prevIcon !== iconName) {
+            this._log("State changed: " + status.state + (status.exitNode ? " (" + status.exitNode + ")" : ""));
+        }
+        this._prevIcon = iconName;
 
-    on_applet_clicked: function(event) {
-        let state = _getTailscaleState();
-        this.switchItem.setToggleState(state !== "down");
-        this._refreshExitNodes();
-        this.menu.toggle();
-    },
-
-    // ------- UI update ---------------------------------------------
-
-    _updateUI: function() {
-        if (!this.appletDir) return;
-
-        this.state = _getTailscaleState();
-        this.set_applet_icon_symbolic_path(_iconPath(this.appletDir, this.state));
-
-        let tooltip = this.state === "up"
-            ? _("Tailscale: On")
-            : (this.state === "up-exit" ? _("Tailscale: On (exit node)") : _("Tailscale: Off"));
-        this.set_applet_tooltip(tooltip);
+        this.activeExitNode = status.exitNode || null;
+        this.set_applet_icon_symbolic_path(this.metadata.path + "/icons/" + iconName);
 
         if (this.switchItem) {
-            this.switchItem.setToggleState(this.state !== "down");
+            this.switchItem.setToggleState(status.state !== "down");
         }
-    },
 
-    _scheduleUIUpdate: function(delaySeconds) {
+        this._commandPending = false;
+        this.statusItem.actor.hide();
+    }
+
+    _scheduleUIUpdate(delaySeconds) {
         if (this._settleTimeout) {
             Mainloop.source_remove(this._settleTimeout);
         }
-        this._settleTimeout = Mainloop.timeout_add_seconds(
-            delaySeconds,
-            Lang.bind(this, function() {
-                this._updateUI();
-                this._settleTimeout = null;
-                return false;
-            })
-        );
-    },
+        this._settleTimeout = Mainloop.timeout_add_seconds(delaySeconds, Lang.bind(this, function() {
+            this._updateUI();
+            this._settleTimeout = null;
+            return false;
+        }));
+    }
 
-    // ------- Polling -----------------------------------------------
+    _showError(message) {
+        if (message) {
+            this._logError(message);
+            this.set_applet_tooltip(_("Error: ") + message);
+        }
+    }
 
-    startPolling: function() {
+    _refreshDebug() {
+        if (this.show_debug) {
+            this.debugParent.actor.show();
+            let submenu = this.debugParent.menu;
+            submenu.removeAll();
+            for (let i = 0; i < this._logBuffer.length; i++) {
+                let entry = this._logBuffer[i];
+                let item = new PopupMenu.PopupMenuItem(entry.text);
+                item.setSensitive(false);
+                submenu.addMenuItem(item);
+            }
+            if (this._logBuffer.length === 0) {
+                let item = new PopupMenu.PopupMenuItem(_("No log entries"));
+                item.setSensitive(false);
+                submenu.addMenuItem(item);
+            }
+        } else {
+            this.debugParent.actor.hide();
+        }
+    }
+
+    _startPolling() {
         this._stopPolling();
         let interval = typeof this.poll_interval === "number" ? this.poll_interval : 60;
         interval = Math.max(10, Math.min(120, interval));
 
-        this.pollId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT,
-            interval,
-            Lang.bind(this, function() {
-                this._updateUI();
-                return true;
-            })
-        );
-    },
+        this.pollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, interval, Lang.bind(this, function() {
+            this._updateUI();
+            return true;
+        }));
+    }
 
-    _stopPolling: function() {
+    _stopPolling() {
         if (this.pollId) {
             GLib.source_remove(this.pollId);
             this.pollId = null;
         }
+        if (this._settleTimeout) {
+            Mainloop.source_remove(this._settleTimeout);
+            this._settleTimeout = null;
+        }
+        if (this._pendingTimeout) {
+            Mainloop.source_remove(this._pendingTimeout);
+            this._pendingTimeout = null;
+        }
+        this._commandPending = false;
     }
-};
+
+    on_applet_clicked(event) {
+        let status = _getTailscaleStatus();
+        this.switchItem.setToggleState(status.state !== "down");
+        this.statusItem.actor.hide();
+        this._commandPending = false;
+        this._refreshExitNodes();
+        this._refreshDebug();
+        this.menu.toggle();
+    }
+
+    on_applet_removed_from_panel() {
+        this._stopPolling();
+    }
+}
 
 function main(metadata, orientation, panelHeight, instanceId) {
-    let applet = new TailscaleApplet(orientation, panelHeight, instanceId);
-    applet.meta = metadata;
-    applet.appletDir = metadata.path;
-    applet._instanceId = instanceId;
-    applet.startPolling();
-    return applet;
+    try {
+        return new TailscaleApplet(metadata, orientation, panelHeight, instanceId);
+    } catch (e) {
+        global.logError("tailscale@mubashirzamir: Failed to start applet: " + e);
+        throw e;
+    }
 }
